@@ -86,7 +86,7 @@ ssl-vendor = ["ssl", "openssl/vendored", "openssl-probe"]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 gethostname = "0.2.0"
-socket2 = { version = "0.4.0", features = ["all"] }
+socket2 = { version = "0.4.2", features = ["all"] }
 dns-lookup = "1.0"
 openssl = { version = "0.10.32", optional = true }
 openssl-sys = { version = "0.9", optional = true }
