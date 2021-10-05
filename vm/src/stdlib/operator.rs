@@ -11,10 +11,9 @@ pub(crate) use _operator::make_module;
 mod _operator {
     use crate::common::cmp;
     use crate::{
-        builtins::{int, PyInt, PyIntRef, PyStrRef, PyTypeRef},
-        byteslike::ArgBytesLike,
-        function::{FuncArgs, KwArgs, OptionalArg},
-        iterator,
+        builtins::{PyInt, PyIntRef, PyStrRef, PyTypeRef},
+        function::{ArgBytesLike, FuncArgs, KwArgs, OptionalArg},
+        protocol::PyIter,
         slots::{
             Callable,
             PyComparisonOp::{Eq, Ge, Gt, Le, Lt, Ne},
@@ -218,10 +217,10 @@ mod _operator {
 
     /// Return the number of occurrences of b in a.
     #[pyfunction(name = "countOf")]
-    fn count_of(a: PyObjectRef, b: PyObjectRef, vm: &VirtualMachine) -> PyResult<usize> {
+    fn count_of(a: PyIter, b: PyObjectRef, vm: &VirtualMachine) -> PyResult<usize> {
         let mut count: usize = 0;
-        let iter = iterator::get_iter(vm, a)?;
-        while let Some(element) = iterator::get_next_object(vm, &iter)? {
+        for element in a.iter_without_hint::<PyObjectRef>(vm)? {
+            let element = element?;
             if element.is(&b) || vm.bool_eq(&b, &element)? {
                 count += 1;
             }
@@ -243,14 +242,12 @@ mod _operator {
 
     /// Return the number of occurrences of b in a.
     #[pyfunction(name = "indexOf")]
-    fn index_of(a: PyObjectRef, b: PyObjectRef, vm: &VirtualMachine) -> PyResult<usize> {
-        let mut index: usize = 0;
-        let iter = iterator::get_iter(vm, a)?;
-        while let Some(element) = iterator::get_next_object(vm, &iter)? {
+    fn index_of(a: PyIter, b: PyObjectRef, vm: &VirtualMachine) -> PyResult<usize> {
+        for (index, element) in a.iter_without_hint::<PyObjectRef>(vm)?.enumerate() {
+            let element = element?;
             if element.is(&b) || vm.bool_eq(&b, &element)? {
                 return Ok(index);
             }
-            index += 1;
         }
         Err(vm.new_value_error("sequence.index(x): x not in sequence".to_owned()))
     }
@@ -283,10 +280,11 @@ mod _operator {
                         v.class().name()
                     )));
                 }
-                int::try_to_primitive(v.payload::<PyInt>().unwrap().as_bigint(), vm)
+                v.payload::<PyInt>().unwrap().try_to_primitive(vm)
             })
             .unwrap_or(Ok(0))?;
-        iterator::length_hint(vm, obj).map(|v| vm.ctx.new_int(v.unwrap_or(default)))
+        vm.length_hint(obj)
+            .map(|v| vm.ctx.new_int(v.unwrap_or(default)))
     }
 
     // Inplace Operators
@@ -436,7 +434,7 @@ mod _operator {
     #[pyimpl(with(Callable))]
     impl PyAttrGetter {
         #[pyslot]
-        fn tp_new(cls: PyTypeRef, args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+        fn slot_new(cls: PyTypeRef, args: FuncArgs, vm: &VirtualMachine) -> PyResult {
             let nattr = args.args.len();
             // Check we get no keyword and at least one positional.
             if !args.kwargs.is_empty() {
@@ -533,7 +531,7 @@ mod _operator {
     #[pyimpl(with(Callable))]
     impl PyItemGetter {
         #[pyslot]
-        fn tp_new(cls: PyTypeRef, args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+        fn slot_new(cls: PyTypeRef, args: FuncArgs, vm: &VirtualMachine) -> PyResult {
             // Check we get no keyword and at least one positional.
             if !args.kwargs.is_empty() {
                 return Err(vm.new_type_error("itemgetter() takes no keyword arguments".to_owned()));

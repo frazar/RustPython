@@ -5,7 +5,7 @@ use crate::{
     exceptions::{self, IntoPyException},
     function::{ArgCallable, FuncArgs, KwArgs, OptionalArg},
     py_io,
-    slots::{SlotGetattro, SlotSetattro},
+    slots::{SlotConstructor, SlotGetattro, SlotSetattro},
     utils::Either,
     IdProtocol, ItemProtocol, PyClassImpl, PyObjectRef, PyRef, PyResult, PyValue, TypeProtocol,
     VirtualMachine,
@@ -103,7 +103,7 @@ impl fmt::Debug for PyLock {
     }
 }
 
-#[pyimpl]
+#[pyimpl(with(SlotConstructor))]
 impl PyLock {
     #[pymethod]
     #[pymethod(name = "acquire_lock")]
@@ -138,6 +138,13 @@ impl PyLock {
     }
 }
 
+impl SlotConstructor for PyLock {
+    type Args = FuncArgs;
+    fn py_new(_cls: PyTypeRef, _args: Self::Args, vm: &VirtualMachine) -> PyResult {
+        Err(vm.new_type_error("cannot create '_thread.lock' instances".to_owned()))
+    }
+}
+
 pub type RawRMutex = RawReentrantMutex<RawMutex, RawThreadId>;
 #[pyclass(module = "thread", name = "RLock")]
 #[derive(PyValue)]
@@ -154,7 +161,7 @@ impl fmt::Debug for PyRLock {
 #[pyimpl]
 impl PyRLock {
     #[pyslot]
-    fn tp_new(cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    fn slot_new(cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         PyRLock {
             mu: RawRMutex::INIT,
         }
@@ -300,7 +307,7 @@ impl PyLocal {
     }
 
     #[pyslot]
-    fn tp_new(cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    fn slot_new(cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         PyLocal {
             data: ThreadLocal::new(),
         }

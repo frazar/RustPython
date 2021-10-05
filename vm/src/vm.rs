@@ -4,39 +4,40 @@
 //!   https://github.com/ProgVal/pythonvm-rust/blob/master/src/processor/mod.rs
 //!
 
+#[cfg(feature = "rustpython-compiler")]
+use crate::compile::{self, CompileError, CompileErrorType, CompileOpts};
+use crate::{
+    builtins::{
+        code::{self, PyCode},
+        module, object,
+        tuple::{PyTuple, PyTupleRef, PyTupleTyped},
+        PyBaseException, PyBaseExceptionRef, PyDictRef, PyInt, PyIntRef, PyList, PyModule, PyStr,
+        PyStrRef, PyTypeRef,
+    },
+    bytecode,
+    codecs::CodecsRegistry,
+    common::{ascii, hash::HashSecret, lock::PyMutex, rc::PyRc},
+    exceptions,
+    frame::{ExecutionResult, Frame, FrameRef},
+    frozen,
+    function::{FuncArgs, IntoFuncArgs},
+    import,
+    protocol::{PyIterIter, PyIterReturn},
+    scope::Scope,
+    signal::NSIG,
+    slots::PyComparisonOp,
+    stdlib,
+    utils::Either,
+    IdProtocol, IntoPyObject, ItemProtocol, PyArithmeticValue, PyContext, PyLease, PyMethod,
+    PyObject, PyObjectRef, PyRef, PyRefExact, PyResult, PyValue, TryFromObject, TryIntoRef,
+    TypeProtocol,
+};
+use crossbeam_utils::atomic::AtomicCell;
+use num_traits::{Signed, ToPrimitive};
 use std::borrow::Cow;
 use std::cell::{Cell, Ref, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-
-use crossbeam_utils::atomic::AtomicCell;
-use num_traits::{Signed, ToPrimitive};
-
-use crate::builtins::code::{self, PyCode, PyCodeRef};
-use crate::builtins::dict::PyDictRef;
-use crate::builtins::int::{PyInt, PyIntRef};
-use crate::builtins::list::PyList;
-use crate::builtins::module::{self, PyModule};
-use crate::builtins::object;
-use crate::builtins::pystr::{PyStr, PyStrRef};
-use crate::builtins::pytype::PyTypeRef;
-use crate::builtins::tuple::{PyTuple, PyTupleRef, PyTupleTyped};
-use crate::codecs::CodecsRegistry;
-use crate::common::{hash::HashSecret, lock::PyMutex, rc::PyRc};
-#[cfg(feature = "rustpython-compiler")]
-use crate::compile::{self, CompileError, CompileErrorType, CompileOpts};
-use crate::exceptions::{self, PyBaseException, PyBaseExceptionRef};
-use crate::frame::{ExecutionResult, Frame, FrameRef};
-use crate::function::{FuncArgs, IntoFuncArgs};
-use crate::scope::Scope;
-use crate::slots::PyComparisonOp;
-use crate::utils::Either;
-use crate::{builtins, bytecode, frozen, import, iterator, stdlib, sysmodule};
-use crate::{
-    IdProtocol, IntoPyObject, ItemProtocol, PyArithmaticValue, PyContext, PyLease, PyMethod,
-    PyObject, PyObjectRef, PyRef, PyRefExact, PyResult, PyValue, TryFromObject, TryIntoRef,
-    TypeProtocol,
-};
 
 // use objects::ects;
 
@@ -117,7 +118,7 @@ pub(crate) mod thread {
 
 pub struct PyGlobalState {
     pub settings: PySettings,
-    pub stdlib_inits: stdlib::StdlibMap,
+    pub module_inits: stdlib::StdlibMap,
     pub frozen: HashMap<String, code::FrozenModule, ahash::RandomState>,
     pub stacksize: AtomicCell<usize>,
     pub thread_count: AtomicCell<usize>,
@@ -125,8 +126,6 @@ pub struct PyGlobalState {
     pub atexit_funcs: PyMutex<Vec<(PyObjectRef, FuncArgs)>>,
     pub codec_registry: CodecsRegistry,
 }
-
-pub const NSIG: usize = 64;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum InitParameter {
@@ -265,7 +264,7 @@ impl VirtualMachine {
         const NONE: Option<PyObjectRef> = None;
         let signal_handlers = RefCell::new([NONE; NSIG]);
 
-        let stdlib_inits = stdlib::get_module_inits();
+        let module_inits = stdlib::get_module_inits();
 
         let hash_secret = match settings.hash_seed {
             Some(seed) => HashSecret::new(seed),
@@ -290,7 +289,7 @@ impl VirtualMachine {
             repr_guards: RefCell::default(),
             state: PyRc::new(PyGlobalState {
                 settings,
-                stdlib_inits,
+                module_inits,
                 frozen: HashMap::default(),
                 stacksize: AtomicCell::new(0),
                 thread_count: AtomicCell::new(0),
@@ -307,13 +306,13 @@ impl VirtualMachine {
         module::init_module_dict(
             &vm,
             &builtins_dict,
-            vm.ctx.new_ascii_literal(crate::utils::ascii!("builtins")),
+            vm.ctx.new_ascii_literal(ascii!("builtins")),
             vm.ctx.none(),
         );
         module::init_module_dict(
             &vm,
             &sysmod_dict,
-            vm.ctx.new_ascii_literal(crate::utils::ascii!("sys")),
+            vm.ctx.new_ascii_literal(ascii!("sys")),
             vm.ctx.none(),
         );
         vm
@@ -326,8 +325,8 @@ impl VirtualMachine {
             panic!("Double Initialize Error");
         }
 
-        builtins::make_module(self, self.builtins.clone());
-        sysmodule::make_module(self, self.sys_module.clone(), self.builtins.clone());
+        stdlib::builtins::make_module(self, self.builtins.clone());
+        stdlib::sys::make_module(self, self.sys_module.clone(), self.builtins.clone());
 
         let mut inner_init = || -> PyResult<()> {
             #[cfg(not(target_arch = "wasm32"))]
@@ -393,7 +392,7 @@ impl VirtualMachine {
     {
         let state = PyRc::get_mut(&mut self.state)
             .expect("can't add_native_module when there are multiple threads");
-        state.stdlib_inits.insert(name.into(), module);
+        state.module_inits.insert(name.into(), module);
     }
 
     /// Can only be used in the initialization closure passed to [`Interpreter::new_with_init`]
@@ -476,7 +475,10 @@ impl VirtualMachine {
             if let Err(e) = self.invoke(&func, args) {
                 last_exc = Some(e.clone());
                 if !e.isinstance(&self.ctx.exceptions.system_exit) {
-                    writeln!(sysmodule::PyStderr(self), "Error in atexit._run_exitfuncs:");
+                    writeln!(
+                        stdlib::sys::PyStderr(self),
+                        "Error in atexit._run_exitfuncs:"
+                    );
                     exceptions::print_exception(self, e);
                 }
             }
@@ -487,12 +489,13 @@ impl VirtualMachine {
         }
     }
 
-    pub fn run_code_obj(&self, code: PyCodeRef, scope: Scope) -> PyResult {
+    pub fn run_code_obj(&self, code: PyRef<PyCode>, scope: Scope) -> PyResult {
         let frame =
             Frame::new(code, scope, self.builtins.dict().unwrap(), &[], self).into_ref(self);
         self.run_frame_full(frame)
     }
 
+    #[inline(always)]
     pub fn run_frame_full(&self, frame: FrameRef) -> PyResult {
         match self.run_frame(frame)? {
             ExecutionResult::Return(value) => Ok(value),
@@ -572,16 +575,17 @@ impl VirtualMachine {
         value.into_pyobject(self)
     }
 
-    pub fn new_code_object(&self, code: impl code::IntoCodeObject) -> PyCodeRef {
+    pub fn new_code_object(&self, code: impl code::IntoCodeObject) -> PyRef<PyCode> {
         self.ctx.new_code_object(code.into_codeobj(self))
     }
 
-    pub fn new_module(&self, name: &str, dict: PyDictRef) -> PyObjectRef {
+    pub fn new_module(&self, name: &str, dict: PyDictRef, doc: Option<&str>) -> PyObjectRef {
         module::init_module_dict(
             self,
             &dict,
             self.new_pyobj(name.to_owned()),
-            self.ctx.none(),
+            doc.map(|doc| self.new_pyobj(doc.to_owned()))
+                .unwrap_or_else(|| self.ctx.none()),
         );
         PyObject::new(PyModule {}, self.ctx.types.module_type.clone(), Some(dict))
     }
@@ -796,12 +800,17 @@ impl VirtualMachine {
         self.new_exception_msg(memory_error_type, msg)
     }
 
-    pub fn new_stop_iteration(&self) -> PyBaseExceptionRef {
-        let stop_iteration_type = self.ctx.exceptions.stop_iteration.clone();
-        self.new_exception_empty(stop_iteration_type)
+    pub fn new_stop_iteration(&self, value: Option<PyObjectRef>) -> PyBaseExceptionRef {
+        let args = if let Some(value) = value {
+            vec![value]
+        } else {
+            Vec::new()
+        };
+        self.new_exception(self.ctx.exceptions.stop_iteration.clone(), args)
     }
 
-    // TODO: #[track_caller] when stabilized
+    #[track_caller]
+    #[cold]
     fn _py_panic_failed(&self, exc: PyBaseExceptionRef, msg: &str) -> ! {
         #[cfg(not(all(target_arch = "wasm32", not(target_os = "wasi"))))]
         {
@@ -828,13 +837,21 @@ impl VirtualMachine {
             panic!("{}; exception backtrace above", msg)
         }
     }
+    #[track_caller]
     pub fn unwrap_pyresult<T>(&self, result: PyResult<T>) -> T {
-        result.unwrap_or_else(|exc| {
-            self._py_panic_failed(exc, "called `vm.unwrap_pyresult()` on an `Err` value")
-        })
+        match result {
+            Ok(x) => x,
+            Err(exc) => {
+                self._py_panic_failed(exc, "called `vm.unwrap_pyresult()` on an `Err` value")
+            }
+        }
     }
+    #[track_caller]
     pub fn expect_pyresult<T>(&self, result: PyResult<T>, msg: &str) -> T {
-        result.unwrap_or_else(|exc| self._py_panic_failed(exc, msg))
+        match result {
+            Ok(x) => x,
+            Err(exc) => self._py_panic_failed(exc, msg),
+        }
     }
 
     pub fn new_scope_with_builtins(&self) -> Scope {
@@ -1193,7 +1210,7 @@ impl VirtualMachine {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn invoke<T>(&self, func_ref: &PyObjectRef, args: T) -> PyResult
     where
         T: IntoFuncArgs,
@@ -1267,14 +1284,7 @@ impl VirtualMachine {
                 .map(|obj| func(obj.clone()))
                 .collect()
         } else {
-            let iter = iterator::get_iter(self, value.clone())?;
-            let cap = match iterator::length_hint(self, value.clone()) {
-                Err(e) if e.class().is(&self.ctx.exceptions.runtime_error) => return Err(e),
-                Ok(Some(value)) => value,
-                // Use a power of 2 as a default capacity.
-                _ => 4,
-            };
-            iterator::try_map(self, &iter, cap, |obj| func(obj))
+            self.map_pyiter(value, |obj| func(obj))
         }
     }
 
@@ -1315,18 +1325,35 @@ impl VirtualMachine {
             ref t @ PyTuple => Ok(t.as_slice().iter().cloned().map(f).collect()),
             // TODO: put internal iterable type
             obj => {
-                let iter = iterator::get_iter(self, obj.clone())?;
-                let cap = match iterator::length_hint(self, obj.clone()) {
-                    Err(e) if e.class().is(&self.ctx.exceptions.runtime_error) => {
-                        return Ok(Err(e))
-                    }
-                    Ok(Some(value)) => value,
-                    // Use a power of 2 as a default capacity.
-                    _ => 4,
-                };
-                Ok(iterator::try_map(self, &iter, cap, f))
+                Ok(self.map_pyiter(obj, f))
             }
         })
+    }
+
+    fn map_pyiter<F, R>(&self, value: &PyObjectRef, mut f: F) -> PyResult<Vec<R>>
+    where
+        F: FnMut(PyObjectRef) -> PyResult<R>,
+    {
+        let iter = value.clone().get_iter(self)?;
+        let cap = match self.length_hint(value.clone()) {
+            Err(e) if e.class().is(&self.ctx.exceptions.runtime_error) => return Err(e),
+            Ok(Some(value)) => Some(value),
+            // Use a power of 2 as a default capacity.
+            _ => None,
+        };
+        // TODO: fix extend to do this check (?), see test_extend in Lib/test/list_tests.py,
+        // https://github.com/python/cpython/blob/v3.9.0/Objects/listobject.c#L922-L928
+        if let Some(cap) = cap {
+            if cap >= isize::max_value() as usize {
+                return Ok(Vec::new());
+            }
+        }
+
+        let mut results = PyIterIter::new(self, iter.as_object(), cap)
+            .map(|element| f(element?))
+            .collect::<PyResult<Vec<_>>>()?;
+        results.shrink_to_fit();
+        Ok(results)
     }
 
     // get_attribute should be used for full attribute access (usually from user code).
@@ -1437,7 +1464,7 @@ impl VirtualMachine {
         if let Some(method_or_err) = self.get_method(obj.clone(), method) {
             let method = method_or_err?;
             let result = self.invoke(&method, (arg.clone(),))?;
-            if let PyArithmaticValue::Implemented(x) = PyArithmaticValue::from_object(self, result)
+            if let PyArithmeticValue::Implemented(x) = PyArithmeticValue::from_object(self, result)
             {
                 return Ok(x);
             }
@@ -1550,7 +1577,7 @@ impl VirtualMachine {
     pub fn check_signals(&self) -> PyResult<()> {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            crate::stdlib::signal::check_signals(self)
+            crate::signal::check_signals(self)
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -1573,7 +1600,7 @@ impl VirtualMachine {
         source: &str,
         mode: compile::Mode,
         source_path: String,
-    ) -> Result<PyCodeRef, CompileError> {
+    ) -> Result<PyRef<PyCode>, CompileError> {
         self.compile_with_opts(source, mode, source_path, self.compile_opts())
     }
 
@@ -1584,7 +1611,7 @@ impl VirtualMachine {
         mode: compile::Mode,
         source_path: String,
         opts: CompileOpts,
-    ) -> Result<PyCodeRef, CompileError> {
+    ) -> Result<PyRef<PyCode>, CompileError> {
         compile::compile(source, mode, source_path, opts)
             .map(|code| PyCode::new(self.map_codeobj(code)).into_ref(self))
     }
@@ -1819,7 +1846,7 @@ impl VirtualMachine {
                 .mro_find_map(|cls| cls.slots.richcompare.load())
                 .unwrap();
             Ok(match cmp(obj, other, op, self)? {
-                Either::A(obj) => PyArithmaticValue::from_object(self, obj).map(Either::A),
+                Either::A(obj) => PyArithmeticValue::from_object(self, obj).map(Either::A),
                 Either::B(arithmetic) => arithmetic.map(Either::B),
             })
         };
@@ -1833,16 +1860,16 @@ impl VirtualMachine {
         if is_strict_subclass {
             let res = call_cmp(w, v, swapped)?;
             checked_reverse_op = true;
-            if let PyArithmaticValue::Implemented(x) = res {
+            if let PyArithmeticValue::Implemented(x) = res {
                 return Ok(x);
             }
         }
-        if let PyArithmaticValue::Implemented(x) = call_cmp(v, w, op)? {
+        if let PyArithmeticValue::Implemented(x) = call_cmp(v, w, op)? {
             return Ok(x);
         }
         if !checked_reverse_op {
             let res = call_cmp(w, v, swapped)?;
-            if let PyArithmaticValue::Implemented(x) = res {
+            if let PyArithmeticValue::Implemented(x) = res {
                 return Ok(x);
             }
         }
@@ -1909,6 +1936,52 @@ impl VirtualMachine {
         })
     }
 
+    pub fn length_hint(&self, iter: PyObjectRef) -> PyResult<Option<usize>> {
+        if let Some(len) = self.obj_len_opt(&iter) {
+            match len {
+                Ok(len) => return Ok(Some(len)),
+                Err(e) => {
+                    if !e.isinstance(&self.ctx.exceptions.type_error) {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        let hint = match self.get_method(iter, "__length_hint__") {
+            Some(hint) => hint?,
+            None => return Ok(None),
+        };
+        let result = match self.invoke(&hint, ()) {
+            Ok(res) => {
+                if res.is(&self.ctx.not_implemented) {
+                    return Ok(None);
+                }
+                res
+            }
+            Err(e) => {
+                return if e.isinstance(&self.ctx.exceptions.type_error) {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            }
+        };
+        let hint = result
+            .payload_if_subclass::<PyInt>(self)
+            .ok_or_else(|| {
+                self.new_type_error(format!(
+                    "'{}' object cannot be interpreted as an integer",
+                    result.class().name()
+                ))
+            })?
+            .try_to_primitive::<isize>(self)?;
+        if hint.is_negative() {
+            Err(self.new_value_error("__length_hint__() should return >= 0".to_owned()))
+        } else {
+            Ok(Some(hint as usize))
+        }
+    }
+
     /// Checks that the multiplication is able to be performed. On Ok returns the
     /// index as a usize for sequences to be able to use immediately.
     pub fn check_repeat_or_memory_error(&self, length: usize, n: isize) -> PyResult<usize> {
@@ -1923,9 +1996,9 @@ impl VirtualMachine {
 
     // https://docs.python.org/3/reference/expressions.html#membership-test-operations
     fn _membership_iter_search(&self, haystack: PyObjectRef, needle: PyObjectRef) -> PyResult {
-        let iter = iterator::get_iter(self, haystack)?;
+        let iter = haystack.get_iter(self)?;
         loop {
-            if let Some(element) = iterator::get_next_object(self, &iter)? {
+            if let PyIterReturn::Return(element) = iter.next(self)? {
                 if self.bool_eq(&needle, &element)? {
                     return Ok(self.ctx.new_bool(true));
                 } else {
@@ -2229,7 +2302,7 @@ mod tests {
     #[test]
     fn test_multiply_str() {
         Interpreter::default().enter(|vm| {
-            let a = vm.ctx.new_ascii_literal(crate::utils::ascii!("Hello "));
+            let a = vm.ctx.new_ascii_literal(crate::common::ascii!("Hello "));
             let b = vm.ctx.new_int(4_i32);
             let res = vm._mul(&a, &b).unwrap();
             let value = res.payload::<PyStr>().unwrap();

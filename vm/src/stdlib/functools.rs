@@ -3,41 +3,34 @@ pub(crate) use _functools::make_module;
 #[pymodule]
 mod _functools {
     use crate::function::OptionalArg;
-    use crate::iterator;
+    use crate::protocol::PyIter;
     use crate::vm::VirtualMachine;
-    use crate::{PyObjectRef, PyResult, TypeProtocol};
+    use crate::{PyObjectRef, PyResult};
 
     #[pyfunction]
     fn reduce(
         function: PyObjectRef,
-        sequence: PyObjectRef,
+        iterator: PyIter,
         start_value: OptionalArg<PyObjectRef>,
         vm: &VirtualMachine,
     ) -> PyResult {
-        let iterator = iterator::get_iter(vm, sequence)?;
-
+        let mut iter = iterator.iter_without_hint(vm)?;
         let start_value = if let OptionalArg::Present(val) = start_value {
             val
         } else {
-            iterator::call_next(vm, &iterator).map_err(|err| {
-                if err.isinstance(&vm.ctx.exceptions.stop_iteration) {
-                    let exc_type = vm.ctx.exceptions.type_error.clone();
-                    vm.new_exception_msg(
-                        exc_type,
-                        "reduce() of empty sequence with no initial value".to_owned(),
-                    )
-                } else {
-                    err
-                }
+            iter.next().transpose()?.ok_or_else(|| {
+                let exc_type = vm.ctx.exceptions.type_error.clone();
+                vm.new_exception_msg(
+                    exc_type,
+                    "reduce() of empty sequence with no initial value".to_owned(),
+                )
             })?
         };
 
         let mut accumulator = start_value;
-
-        while let Ok(next_obj) = iterator::call_next(vm, &iterator) {
-            accumulator = vm.invoke(&function, vec![accumulator, next_obj])?
+        for next_obj in iter {
+            accumulator = vm.invoke(&function, vec![accumulator, next_obj?])?
         }
-
         Ok(accumulator)
     }
 }

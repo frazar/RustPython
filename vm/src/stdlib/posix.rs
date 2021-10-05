@@ -2,7 +2,7 @@ use crate::{PyObjectRef, PyResult, VirtualMachine};
 use nix;
 use std::os::unix::io::RawFd;
 
-pub(crate) fn raw_set_inheritable(fd: RawFd, inheritable: bool) -> nix::Result<()> {
+pub fn raw_set_inheritable(fd: RawFd, inheritable: bool) -> nix::Result<()> {
     use nix::fcntl;
     let flags = fcntl::FdFlag::from_bits_truncate(fcntl::fcntl(fd, fcntl::FcntlArg::F_GETFD)?);
     let mut new_flags = flags;
@@ -30,13 +30,13 @@ pub(crate) fn make_module(vm: &VirtualMachine) -> PyObjectRef {
 #[pymodule(name = "posix")]
 pub mod module {
     use crate::{
-        builtins::{int, PyDictRef, PyInt, PyListRef, PyStrRef, PyTupleRef, PyTypeRef},
+        builtins::{PyDictRef, PyInt, PyListRef, PyStrRef, PyTupleRef, PyTypeRef},
         exceptions::IntoPyException,
         function::OptionalArg,
         slots::SlotConstructor,
         stdlib::os::{
             errno_err, DirFd, FollowSymlinks, PathOrFd, PyPathLike, SupportFunc, TargetIsDirectory,
-            _os, fs_metadata,
+            _os, fs_metadata, IOErrorBuilder,
         },
         utils::{Either, ToCString},
         IntoPyObject, ItemProtocol, PyObjectRef, PyResult, PyValue, TryFromObject, VirtualMachine,
@@ -291,9 +291,7 @@ pub mod module {
 
     #[derive(FromArgs)]
     pub(super) struct SimlinkArgs {
-        #[pyarg(any)]
         src: PyPathLike,
-        #[pyarg(any)]
         dst: PyPathLike,
         #[pyarg(flatten)]
         _target_is_directory: TargetIsDirectory,
@@ -331,7 +329,14 @@ pub mod module {
     #[cfg(not(target_os = "redox"))]
     #[pyfunction]
     fn chroot(path: PyPathLike, vm: &VirtualMachine) -> PyResult<()> {
-        nix::unistd::chroot(&*path.path).map_err(|err| err.into_pyexception(vm))
+        use crate::stdlib::os::IOErrorBuilder;
+
+        nix::unistd::chroot(&*path.path).map_err(|err| {
+            // Use `From<nix::Error> for io::Error` when it is available
+            IOErrorBuilder::new(io::Error::from_raw_os_error(err as i32))
+                .filename(path)
+                .into_pyexception(vm)
+        })
     }
 
     // As of now, redox does not seems to support chown command (cf. https://gitlab.redox-os.org/redox-os/coreutils , last checked on 05/07/2020)
@@ -369,10 +374,17 @@ pub mod module {
 
         let dir_fd = dir_fd.get_opt();
         match path {
-            PathOrFd::Path(p) => nix::unistd::fchownat(dir_fd, p.path.as_os_str(), uid, gid, flag),
+            PathOrFd::Path(ref p) => {
+                nix::unistd::fchownat(dir_fd, p.path.as_os_str(), uid, gid, flag)
+            }
             PathOrFd::Fd(fd) => nix::unistd::fchown(fd, uid, gid),
         }
-        .map_err(|err| err.into_pyexception(vm))
+        .map_err(|err| {
+            // Use `From<nix::Error> for io::Error` when it is available
+            IOErrorBuilder::new(io::Error::from_raw_os_error(err as i32))
+                .filename(path)
+                .into_pyexception(vm)
+        })
     }
 
     #[cfg(not(target_os = "redox"))]
@@ -483,20 +495,19 @@ pub mod module {
             use crate::TypeProtocol;
             let priority = self.sched_priority.clone();
             let priority_type = priority.class().name();
-            let value = priority.downcast::<int::PyInt>().map_err(|_| {
+            let value = priority.downcast::<PyInt>().map_err(|_| {
                 vm.new_type_error(format!(
                     "an integer is required (got type {})",
                     priority_type
                 ))
             })?;
-            let sched_priority = int::try_to_primitive(value.as_bigint(), vm)?;
+            let sched_priority = value.try_to_primitive(vm)?;
             Ok(libc::sched_param { sched_priority })
         }
     }
 
     #[derive(FromArgs)]
     pub struct SchedParamArg {
-        #[pyarg(any)]
         sched_priority: PyObjectRef,
     }
     impl SlotConstructor for SchedParam {
@@ -685,6 +696,54 @@ pub mod module {
         Ok(x)
     }
 
+    fn _chmod(
+        path: PyPathLike,
+        dir_fd: DirFd<0>,
+        mode: u32,
+        follow_symlinks: FollowSymlinks,
+        vm: &VirtualMachine,
+    ) -> PyResult<()> {
+        let [] = dir_fd.0;
+        let err_path = path.clone();
+        let body = move || {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = fs_metadata(&path, follow_symlinks.0)?;
+            let mut permissions = meta.permissions();
+            permissions.set_mode(mode);
+            fs::set_permissions(&path, permissions)
+        };
+        body().map_err(|err| {
+            IOErrorBuilder::new(err)
+                .filename(err_path)
+                .into_pyexception(vm)
+        })
+    }
+
+    #[cfg(not(target_os = "redox"))]
+    fn _fchmod(fd: RawFd, mode: u32, vm: &VirtualMachine) -> PyResult<()> {
+        nix::sys::stat::fchmod(
+            fd,
+            nix::sys::stat::Mode::from_bits(mode as libc::mode_t).unwrap(),
+        )
+        .map_err(|err| err.into_pyexception(vm))
+    }
+
+    #[cfg(not(target_os = "redox"))]
+    #[pyfunction]
+    fn chmod(
+        path: PathOrFd,
+        dir_fd: DirFd<0>,
+        mode: u32,
+        follow_symlinks: FollowSymlinks,
+        vm: &VirtualMachine,
+    ) -> PyResult<()> {
+        match path {
+            PathOrFd::Path(path) => _chmod(path, dir_fd, mode, follow_symlinks, vm),
+            PathOrFd::Fd(fd) => _fchmod(fd, mode, vm),
+        }
+    }
+
+    #[cfg(target_os = "redox")]
     #[pyfunction]
     fn chmod(
         path: PyPathLike,
@@ -693,24 +752,28 @@ pub mod module {
         follow_symlinks: FollowSymlinks,
         vm: &VirtualMachine,
     ) -> PyResult<()> {
-        let [] = dir_fd.0;
-        let body = move || {
-            use std::os::unix::fs::PermissionsExt;
-            let meta = fs_metadata(&path, follow_symlinks.0)?;
-            let mut permissions = meta.permissions();
-            permissions.set_mode(mode);
-            fs::set_permissions(&path, permissions)
-        };
-        body().map_err(|err| err.into_pyexception(vm))
+        _chmod(path, dir_fd, mode, follow_symlinks, vm)
+    }
+
+    #[cfg(not(target_os = "redox"))]
+    #[pyfunction]
+    fn fchmod(fd: RawFd, mode: u32, vm: &VirtualMachine) -> PyResult<()> {
+        _fchmod(fd, mode, vm)
+    }
+
+    #[cfg(not(target_os = "redox"))]
+    #[pyfunction]
+    fn lchmod(path: PyPathLike, mode: u32, vm: &VirtualMachine) -> PyResult<()> {
+        _chmod(path, DirFd::default(), mode, FollowSymlinks(false), vm)
     }
 
     #[pyfunction]
     fn execv(
-        path: PyStrRef,
+        path: PyPathLike,
         argv: Either<PyListRef, PyTupleRef>,
         vm: &VirtualMachine,
     ) -> PyResult<()> {
-        let path = path.to_cstring(vm)?;
+        let path = path.into_cstring(vm)?;
 
         let argv = vm.extract_elements_func(argv.as_object(), |obj| {
             PyStrRef::try_from_object(vm, obj)?.to_cstring(vm)
@@ -1033,8 +1096,24 @@ pub mod module {
     }
 
     #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
-    fn envp_from_dict(dict: PyDictRef, vm: &VirtualMachine) -> PyResult<Vec<CString>> {
-        dict.into_iter()
+    fn envp_from_dict(
+        env: crate::protocol::PyMapping,
+        vm: &VirtualMachine,
+    ) -> PyResult<Vec<CString>> {
+        let keys = env.keys(vm)?;
+        let values = env.values(vm)?;
+
+        let keys = PyListRef::try_from_object(vm, keys)
+            .map_err(|_| vm.new_type_error("env.keys() is not a list".to_owned()))?
+            .borrow_vec()
+            .to_vec();
+        let values = PyListRef::try_from_object(vm, values)
+            .map_err(|_| vm.new_type_error("env.values() is not a list".to_owned()))?
+            .borrow_vec()
+            .to_vec();
+
+        keys.into_iter()
+            .zip(values.into_iter())
             .map(|(k, v)| {
                 let k = PyPathLike::try_from_object(vm, k)?.into_bytes();
                 let v = PyPathLike::try_from_object(vm, v)?.into_bytes();
@@ -1069,7 +1148,7 @@ pub mod module {
         #[pyarg(positional)]
         args: crate::function::ArgIterable<PyPathLike>,
         #[pyarg(positional)]
-        env: crate::builtins::dict::PyMapping,
+        env: crate::protocol::PyMapping,
         #[pyarg(named, default)]
         file_actions: Option<crate::function::ArgIterable<PyTupleRef>>,
         #[pyarg(named, default)]
@@ -1182,7 +1261,7 @@ pub mod module {
                 .map(|s| s.as_ptr() as _)
                 .chain(std::iter::once(std::ptr::null_mut()))
                 .collect();
-            let mut env = envp_from_dict(self.env.into_dict(), vm)?;
+            let mut env = envp_from_dict(self.env, vm)?;
             let envp: Vec<*mut libc::c_char> = env
                 .iter_mut()
                 .map(|s| s.as_ptr() as _)
@@ -1472,7 +1551,7 @@ pub mod module {
     impl TryFromObject for ConfName {
         fn try_from_object(vm: &VirtualMachine, obj: PyObjectRef) -> PyResult<Self> {
             let i = match obj.downcast::<PyInt>() {
-                Ok(int) => int::try_to_primitive(int.as_bigint(), vm)?,
+                Ok(int) => int.try_to_primitive(vm)?,
                 Err(obj) => {
                     let s = PyStrRef::try_from_object(vm, obj)?;
                     s.as_str().parse::<PathconfVar>().map_err(|_| {
@@ -1689,13 +1768,9 @@ pub mod module {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[derive(FromArgs)]
     struct SendFileArgs {
-        #[pyarg(any)]
         out_fd: i32,
-        #[pyarg(any)]
         in_fd: i32,
-        #[pyarg(any)]
         offset: crate::crt_fd::Offset,
-        #[pyarg(any)]
         count: i64,
         #[cfg(target_os = "macos")]
         #[pyarg(any, optional)]
@@ -1729,10 +1804,10 @@ pub mod module {
     fn _extract_vec_bytes(
         x: OptionalArg,
         vm: &VirtualMachine,
-    ) -> PyResult<Option<Vec<crate::byteslike::ArgBytesLike>>> {
+    ) -> PyResult<Option<Vec<crate::function::ArgBytesLike>>> {
         let inner = match x.into_option() {
             Some(v) => {
-                let v = vm.extract_elements::<crate::byteslike::ArgBytesLike>(&v)?;
+                let v = vm.extract_elements::<crate::function::ArgBytesLike>(&v)?;
                 if v.is_empty() {
                     None
                 } else {

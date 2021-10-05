@@ -6,7 +6,7 @@ use crate::builtins::int::PyInt;
 use crate::builtins::slice::{PySlice, PySliceRef};
 use crate::utils::Either;
 use crate::VirtualMachine;
-use crate::{PyObjectRef, PyResult, TryFromObject, TypeProtocol};
+use crate::{PyObjectRef, PyResult, TypeProtocol};
 
 pub trait PySliceableSequenceMut {
     type Item: Clone;
@@ -359,12 +359,6 @@ impl SequenceIndex {
     }
 }
 
-impl TryFromObject for SequenceIndex {
-    fn try_from_object(vm: &VirtualMachine, obj: PyObjectRef) -> PyResult<Self> {
-        Self::try_from_object_for(vm, obj, "sequence")
-    }
-}
-
 /// Get the index into a sequence like type. Get it from a python integer
 /// object, accounting for negative index, and out of bounds issues.
 // pub fn get_sequence_index(vm: &VirtualMachine, index: &PyIntRef, length: usize) -> PyResult<usize> {
@@ -404,7 +398,7 @@ pub(crate) fn wrap_index(p: isize, len: usize) -> Option<usize> {
 }
 
 // return pos is in range [0, len] inclusive
-pub(crate) fn saturate_index(p: isize, len: usize) -> usize {
+pub fn saturate_index(p: isize, len: usize) -> usize {
     let mut p = p;
     let len = len.to_isize().unwrap();
     if p < 0 {

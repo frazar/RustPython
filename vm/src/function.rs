@@ -1,13 +1,11 @@
 mod argument;
+mod byteslike;
 
 use self::OptionalArg::*;
-use crate::builtins::pytype::PyTypeRef;
-use crate::builtins::tuple::PyTupleRef;
-use crate::exceptions::PyBaseExceptionRef;
-use crate::vm::VirtualMachine;
 use crate::{
+    builtins::{PyBaseExceptionRef, PyTupleRef, PyTypeRef},
     IntoPyObject, IntoPyResult, PyObjectRef, PyRef, PyResult, PyThreadingConstraint, PyValue,
-    TryFromObject, TypeProtocol,
+    TryFromObject, TypeProtocol, VirtualMachine,
 };
 use indexmap::IndexMap;
 use itertools::Itertools;
@@ -15,7 +13,8 @@ use result_like::impl_option_like;
 use std::marker::PhantomData;
 use std::ops::RangeInclusive;
 
-pub use argument::{ArgCallable, ArgIterable, PyIterator};
+pub use argument::{ArgCallable, ArgIterable};
+pub use byteslike::{ArgBytesLike, ArgMemoryBuffer, ArgStrOrBytesLike};
 
 pub trait IntoFuncArgs: Sized {
     fn into_args(self, vm: &VirtualMachine) -> FuncArgs;
@@ -595,6 +594,7 @@ impl<F, T, R, VM> IntoPyNativeFunc<(T, R, VM)> for F
 where
     F: PyNativeFuncInternal<T, R, VM>,
 {
+    #[inline(always)]
     fn call(&self, vm: &VirtualMachine, args: FuncArgs) -> PyResult {
         self.call_(vm, args)
     }

@@ -16,12 +16,9 @@ struct ModuleContext {
     errors: Vec<syn::Error>,
 }
 
-pub fn impl_pymodule(
-    attr: AttributeArgs,
-    module_item: Item,
-) -> std::result::Result<TokenStream, Diagnostic> {
-    let mut module_item = match module_item {
-        Item::Mod(m) => m,
+pub fn impl_pymodule(attr: AttributeArgs, module_item: Item) -> Result<TokenStream> {
+    let (doc, mut module_item) = match module_item {
+        Item::Mod(m) => (m.attrs.doc(), m),
         other => bail_span!(other, "#[pymodule] can only be on a full module"),
     };
     let fake_ident = Ident::new("pymodule", module_item.span());
@@ -58,9 +55,23 @@ pub fn impl_pymodule(
     // append additional items
     let module_name = context.name.as_str();
     let module_extend_items = context.module_extend_items;
+    let doc = doc.or_else(|| {
+        crate::doc::try_read(module_name)
+            .ok()
+            .flatten()
+            .map(str::to_owned)
+    });
+    let doc = if let Some(doc) = doc {
+        quote!(Some(#doc))
+    } else {
+        quote!(None)
+    };
     items.extend(iter_chain![
         parse_quote! {
             pub(crate) const MODULE_NAME: &'static str = #module_name;
+        },
+        parse_quote! {
+            pub(crate) const DOC: Option<&'static str> = #doc;
         },
         parse_quote! {
             pub(crate) fn extend_module(
@@ -75,7 +86,7 @@ pub fn impl_pymodule(
             pub(crate) fn make_module(
                 vm: &::rustpython_vm::VirtualMachine
             ) -> ::rustpython_vm::PyObjectRef {
-                let module = vm.new_module(MODULE_NAME, vm.ctx.new_dict());
+                let module = vm.new_module(MODULE_NAME, vm.ctx.new_dict(), DOC);
                 extend_module(vm, &module);
                 module
             }

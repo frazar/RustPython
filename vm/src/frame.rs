@@ -1,37 +1,31 @@
+use crate::common::{boxvec::BoxVec, lock::PyMutex};
+use crate::{
+    builtins::{
+        asyncgenerator::PyAsyncGenWrappedValue,
+        coroutine::PyCoroutine,
+        function::{PyCell, PyCellRef, PyFunction},
+        generator::PyGenerator,
+        list, pystr, set,
+        traceback::PyTraceback,
+        tuple::{PyTuple, PyTupleTyped},
+        PyBaseExceptionRef, PyCode, PyDict, PyDictRef, PySlice, PyStr, PyStrRef, PyTypeRef,
+    },
+    bytecode,
+    coroutine::Coro,
+    exceptions::{self, ExceptionCtor},
+    function::FuncArgs,
+    protocol::{PyIter, PyIterReturn},
+    scope::Scope,
+    slots::PyComparisonOp,
+    stdlib::builtins,
+    IdProtocol, IntoPyResult, ItemProtocol, PyMethod, PyObjectRef, PyRef, PyResult, PyValue,
+    TryFromObject, TypeProtocol, VirtualMachine,
+};
+use indexmap::IndexMap;
+use itertools::Itertools;
 use std::fmt;
 #[cfg(feature = "threading")]
 use std::sync::atomic;
-
-use indexmap::IndexMap;
-use itertools::Itertools;
-
-use crate::builtins;
-use crate::builtins::asyncgenerator::PyAsyncGenWrappedValue;
-use crate::builtins::code::PyCodeRef;
-use crate::builtins::coroutine::PyCoroutine;
-use crate::builtins::dict::{PyDict, PyDictRef};
-use crate::builtins::function::{PyCell, PyCellRef, PyFunction};
-use crate::builtins::generator::PyGenerator;
-use crate::builtins::pystr::{self, PyStr, PyStrRef};
-use crate::builtins::pytype::PyTypeRef;
-use crate::builtins::slice::PySlice;
-use crate::builtins::traceback::PyTraceback;
-use crate::builtins::tuple::{PyTuple, PyTupleTyped};
-use crate::builtins::{list, set};
-use crate::bytecode;
-use crate::common::boxvec::BoxVec;
-use crate::common::lock::PyMutex;
-use crate::coroutine::Coro;
-use crate::exceptions::{self, ExceptionCtor, PyBaseExceptionRef};
-use crate::function::FuncArgs;
-use crate::iterator;
-use crate::scope::Scope;
-use crate::slots::PyComparisonOp;
-use crate::vm::VirtualMachine;
-use crate::{
-    IdProtocol, ItemProtocol, PyMethod, PyObjectRef, PyRef, PyResult, PyValue, TryFromObject,
-    TypeProtocol,
-};
 
 #[derive(Clone, Debug)]
 struct Block {
@@ -104,7 +98,7 @@ type Lasti = std::cell::Cell<u32>;
 
 #[pyclass(module = false, name = "frame")]
 pub struct Frame {
-    pub code: PyCodeRef,
+    pub code: PyRef<PyCode>,
 
     pub fastlocals: PyMutex<Box<[Option<PyObjectRef>]>>,
     pub(crate) cells_frees: Box<[PyCellRef]>,
@@ -133,48 +127,12 @@ pub enum ExecutionResult {
     Yield(PyObjectRef),
 }
 
-impl ExecutionResult {
-    /// Extract an ExecutionResult from a PyResult returned from e.g. gen.__next__() or gen.send()
-    pub fn from_result(vm: &VirtualMachine, res: PyResult) -> PyResult<Self> {
-        match res {
-            Ok(val) => Ok(ExecutionResult::Yield(val)),
-            Err(err) => {
-                if err.isinstance(&vm.ctx.exceptions.stop_iteration) {
-                    Ok(ExecutionResult::Return(iterator::stop_iter_value(vm, &err)))
-                } else {
-                    Err(err)
-                }
-            }
-        }
-    }
-
-    /// Turn an ExecutionResult into a PyResult that would be returned from a generator or coroutine
-    pub fn into_result(self, async_stopiter: bool, vm: &VirtualMachine) -> PyResult {
-        match self {
-            ExecutionResult::Yield(value) => Ok(value),
-            ExecutionResult::Return(value) => {
-                let stop_iteration = if async_stopiter {
-                    vm.ctx.exceptions.stop_async_iteration.clone()
-                } else {
-                    vm.ctx.exceptions.stop_iteration.clone()
-                };
-                let args = if vm.is_none(&value) {
-                    vec![]
-                } else {
-                    vec![value]
-                };
-                Err(vm.new_exception(stop_iteration, args))
-            }
-        }
-    }
-}
-
 /// A valid execution result, or an exception
 pub type FrameResult = PyResult<Option<ExecutionResult>>;
 
 impl Frame {
     pub(crate) fn new(
-        code: PyCodeRef,
+        code: PyRef<PyCode>,
         scope: Scope,
         builtins: PyDictRef,
         closure: &[PyCellRef],
@@ -207,7 +165,7 @@ impl Frame {
 }
 
 impl FrameRef {
-    #[inline]
+    #[inline(always)]
     fn with_exec<R>(&self, f: impl FnOnce(ExecutingFrame) -> R) -> R {
         let mut state = self.state.lock();
         let exec = ExecutingFrame {
@@ -317,7 +275,7 @@ impl FrameRef {
 /// An executing frame; essentially just a struct to combine the immutable data outside the mutex
 /// with the mutable data inside
 struct ExecutingFrame<'a> {
-    code: &'a PyCodeRef,
+    code: &'a PyRef<PyCode>,
     fastlocals: &'a PyMutex<Box<[Option<PyObjectRef>]>>,
     cells_frees: &'a [PyCellRef],
     locals: &'a PyDictRef,
@@ -433,25 +391,27 @@ impl ExecutingFrame<'_> {
         exc_val: PyObjectRef,
         exc_tb: PyObjectRef,
     ) -> PyResult<ExecutionResult> {
-        if let Some(coro) = self.yield_from_target() {
+        if let Some(gen) = self.yield_from_target() {
             use crate::utils::Either;
             // borrow checker shenanigans - we only need to use exc_type/val/tb if the following
             // variable is Some
-            let thrower = if let Some(coro) = self.builtin_coro(coro) {
+            let thrower = if let Some(coro) = self.builtin_coro(gen) {
                 Some(Either::A(coro))
             } else {
-                vm.get_attribute_opt(coro.clone(), "throw")?.map(Either::B)
+                vm.get_attribute_opt(gen.clone(), "throw")?.map(Either::B)
             };
             if let Some(thrower) = thrower {
                 let ret = match thrower {
-                    Either::A(coro) => coro.throw(exc_type, exc_val, exc_tb, vm),
+                    Either::A(coro) => coro
+                        .throw(gen, exc_type, exc_val, exc_tb, vm)
+                        .into_pyresult(vm), // FIXME:
                     Either::B(meth) => vm.invoke(&meth, vec![exc_type, exc_val, exc_tb]),
                 };
                 return ret.map(ExecutionResult::Yield).or_else(|err| {
                     self.pop_value();
                     self.update_lasti(|i| *i += 1);
                     if err.isinstance(&vm.ctx.exceptions.stop_iteration) {
-                        let val = iterator::stop_iter_value(vm, &err);
+                        let val = vm.unwrap_or_none(err.get_arg(0));
                         self.push_value(val);
                         self.run(vm)
                     } else {
@@ -862,8 +822,8 @@ impl ExecutingFrame<'_> {
             }
             bytecode::Instruction::GetIter => {
                 let iterated_obj = self.pop_value();
-                let iter_obj = iterator::get_iter(vm, iterated_obj)?;
-                self.push_value(iter_obj);
+                let iter_obj = iterated_obj.get_iter(vm)?;
+                self.push_value(iter_obj.into_object());
                 Ok(None)
             }
             bytecode::Instruction::GetAwaitable => {
@@ -1444,13 +1404,19 @@ impl ExecutingFrame<'_> {
         })
     }
 
-    fn _send(&self, coro: &PyObjectRef, val: PyObjectRef, vm: &VirtualMachine) -> PyResult {
-        match self.builtin_coro(coro) {
-            Some(coro) => coro.send(val, vm),
-            None if vm.is_none(&val) => iterator::call_next(vm, coro),
+    fn _send(
+        &self,
+        gen: &PyObjectRef,
+        val: PyObjectRef,
+        vm: &VirtualMachine,
+    ) -> PyResult<PyIterReturn> {
+        match self.builtin_coro(gen) {
+            Some(coro) => coro.send(gen, val, vm),
+            // FIXME: turn return type to PyResult<PyIterReturn> then ExecutionResult will be simplified
+            None if vm.is_none(&val) => PyIter::new(gen).next(vm),
             None => {
-                let meth = vm.get_attribute(coro.clone(), "send")?;
-                vm.invoke(&meth, (val,))
+                let meth = vm.get_attribute(gen.clone(), "send")?;
+                PyIterReturn::from_pyresult(vm.invoke(&meth, (val,)), vm)
             }
         }
     }
@@ -1458,20 +1424,18 @@ impl ExecutingFrame<'_> {
     fn execute_yield_from(&mut self, vm: &VirtualMachine) -> FrameResult {
         // Value send into iterator:
         let val = self.pop_value();
-
         let coro = self.last_value_ref();
+        let result = self._send(coro, val, vm)?;
 
-        let result = self._send(coro, val, vm);
-
-        let result = ExecutionResult::from_result(vm, result)?;
-
+        // PyIterReturn returned from e.g. gen.__next__() or gen.send()
         match result {
-            ExecutionResult::Yield(value) => {
+            PyIterReturn::Return(value) => {
                 // Set back program counter:
                 self.update_lasti(|i| *i -= 1);
                 Ok(Some(ExecutionResult::Yield(value)))
             }
-            ExecutionResult::Return(value) => {
+            PyIterReturn::StopIteration(value) => {
+                let value = vm.unwrap_or_none(value);
                 self.pop_value();
                 self.push_value(value);
                 Ok(None)
@@ -1517,16 +1481,16 @@ impl ExecutingFrame<'_> {
 
     /// The top of stack contains the iterator, lets push it forward
     fn execute_for_iter(&mut self, vm: &VirtualMachine, target: bytecode::Label) -> FrameResult {
-        let top_of_stack = self.last_value();
-        let next_obj = iterator::get_next_object(vm, &top_of_stack);
+        let top_of_stack = PyIter::new(self.last_value());
+        let next_obj = top_of_stack.next(vm);
 
         // Check the next object:
         match next_obj {
-            Ok(Some(value)) => {
+            Ok(PyIterReturn::Return(value)) => {
                 self.push_value(value);
                 Ok(None)
             }
-            Ok(None) => {
+            Ok(PyIterReturn::StopIteration(_)) => {
                 // Pop iterator from stack:
                 self.pop_value();
 
@@ -1550,7 +1514,7 @@ impl ExecutingFrame<'_> {
             .pop_value()
             .downcast::<PyStr>()
             .expect("qualified name to be a string");
-        let code_obj: PyCodeRef = self
+        let code_obj: PyRef<PyCode> = self
             .pop_value()
             .downcast()
             .expect("Second to top value on the stack must be a code object");
