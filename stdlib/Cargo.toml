@@ -91,7 +91,7 @@ dns-lookup = "1.0"
 openssl = { version = "0.10.32", optional = true }
 openssl-sys = { version = "0.9", optional = true }
 openssl-probe = { version = "0.1", optional = true }
-foreign-types-shared = { version = "0.1", optional = true }
+foreign-types-shared = { version = "0.3", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 schannel = "0.1"
