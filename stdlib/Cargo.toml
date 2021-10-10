@@ -40,7 +40,7 @@ unic-ucd-ident     = "0.9"
 # compression
 adler32 = "1.0.3"
 crc32fast = "1.2.0"
-flate2 = "1.0.20"
+flate2 = "1.0.22"
 
 num-complex = "0.4.0"
 num-bigint = "0.4.2"
@@ -50,7 +50,7 @@ crossbeam-utils = "0.8.5"
 itertools = "0.10.1"
 lexical-core = "0.7"
 num-traits = "0.2.14"
-crc = "^1.0.0"
+crc = "^2.0.0"
 memchr = "2"
 base64 = "0.13"
 csv-core = "0.1"
@@ -85,12 +85,12 @@ ssl-vendor = ["ssl", "openssl/vendored", "openssl-probe"]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 gethostname = "0.2.0"
-socket2 = { version = "0.4.0", features = ["all"] }
+socket2 = { version = "0.4.2", features = ["all"] }
 dns-lookup = "1.0"
 openssl = { version = "0.10.32", optional = true }
 openssl-sys = { version = "0.9", optional = true }
 openssl-probe = { version = "0.1", optional = true }
-foreign-types-shared = { version = "0.1", optional = true }
+foreign-types-shared = { version = "0.3", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 schannel = "0.1"
